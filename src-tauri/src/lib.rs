@@ -32,6 +32,7 @@ struct ScanRequest {
     min_bitrate_mbps: f64,
     min_file_size_mb: f64,
     transcode_h264: bool,
+    legacy_codecs: Vec<String>,
     unwanted_extensions: Vec<String>,
 }
 
@@ -118,6 +119,10 @@ fn should_transcode_h264(
         && codec == "h264"
         && (bitrate_threshold_bps == 0 || bitrate_bps >= bitrate_threshold_bps)
         && (size_threshold_bytes == 0 || size_bytes >= size_threshold_bytes)
+}
+
+fn should_transcode_legacy(codec: &str, legacy_codecs: &[String]) -> bool {
+    legacy_codecs.iter().any(|item| item == codec)
 }
 
 fn probe_video(path: &Path) -> Result<ProbeInfo, String> {
@@ -219,6 +224,12 @@ fn scan_videos_blocking(request: ScanRequest) -> Result<Vec<VideoFile>, String> 
         .map(|item| item.trim().trim_start_matches('.').to_ascii_lowercase())
         .filter(|item| !item.is_empty())
         .collect();
+    let legacy_codecs: Vec<String> = request
+        .legacy_codecs
+        .iter()
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect();
     let bitrate_threshold = (request.min_bitrate_mbps.max(0.0) * 1_000_000.0) as u64;
     let size_threshold = (request.min_file_size_mb.max(0.0) * 1_048_576.0) as u64;
     let mut files = Vec::new();
@@ -252,6 +263,7 @@ fn scan_videos_blocking(request: ScanRequest) -> Result<Vec<VideoFile>, String> 
         };
         let bad_container = unwanted.contains(&extension);
         let is_hevc = matches!(probe.codec.as_str(), "hevc" | "h265");
+        let legacy_rule = should_transcode_legacy(&probe.codec, &legacy_codecs);
         let h264_rule = should_transcode_h264(
             &probe.codec,
             probe.bitrate_bps,
@@ -267,6 +279,11 @@ fn scan_videos_blocking(request: ScanRequest) -> Result<Vec<VideoFile>, String> 
             )
         } else if bad_container {
             ("transcode", format!(".{extension} 封装不在保留列表"))
+        } else if legacy_rule {
+            (
+                "transcode",
+                format!("{} 属于已选择的旧编码，将无条件转为 H.265", probe.codec),
+            )
         } else if h264_rule {
             let reason = if bitrate_threshold == 0 {
                 format!(
@@ -788,5 +805,14 @@ mod tests {
         assert!(!valid_log_filename("../m5ga.log"));
         assert!(!valid_log_filename("m5ga.txt"));
         assert!(!valid_log_filename("m5ga 日志.log"));
+    }
+
+    #[test]
+    fn selected_legacy_codecs_transcode_without_thresholds() {
+        let codecs = vec!["mpeg4".to_string(), "vc1".to_string()];
+        assert!(should_transcode_legacy("mpeg4", &codecs));
+        assert!(should_transcode_legacy("vc1", &codecs));
+        assert!(!should_transcode_legacy("h264", &codecs));
+        assert!(!should_transcode_legacy("hevc", &codecs));
     }
 }
