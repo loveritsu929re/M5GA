@@ -17,3 +17,7 @@ Windows 本地批量视频整理工具。递归扫描目录，通过 FFprobe 判
 - 默认输出不节省空间时不替换。
 - MOV/AVI 等转成 MP4 时，如同名 MP4 已存在则不处理该文件。
 - 每次只处理一个文件，适合单 GPU 并降低磁盘压力。
+
+## Release
+`npm run tauri -- build --no-bundle` 
+编译后的单文件`src-tauri\target\release\m5ga.exe`

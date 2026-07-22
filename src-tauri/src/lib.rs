@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    env, fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -30,6 +30,7 @@ struct AppState {
 struct ScanRequest {
     root: String,
     min_bitrate_mbps: f64,
+    min_file_size_mb: f64,
     transcode_h264: bool,
     unwanted_extensions: Vec<String>,
 }
@@ -105,8 +106,18 @@ fn hidden_command(program: &str) -> Command {
     command
 }
 
-fn should_transcode_h264(codec: &str, bitrate_bps: u64, threshold_bps: u64, enabled: bool) -> bool {
-    enabled && codec == "h264" && (threshold_bps == 0 || bitrate_bps >= threshold_bps)
+fn should_transcode_h264(
+    codec: &str,
+    bitrate_bps: u64,
+    size_bytes: u64,
+    bitrate_threshold_bps: u64,
+    size_threshold_bytes: u64,
+    enabled: bool,
+) -> bool {
+    enabled
+        && codec == "h264"
+        && (bitrate_threshold_bps == 0 || bitrate_bps >= bitrate_threshold_bps)
+        && (size_threshold_bytes == 0 || size_bytes >= size_threshold_bytes)
 }
 
 fn probe_video(path: &Path) -> Result<ProbeInfo, String> {
@@ -208,7 +219,8 @@ fn scan_videos_blocking(request: ScanRequest) -> Result<Vec<VideoFile>, String> 
         .map(|item| item.trim().trim_start_matches('.').to_ascii_lowercase())
         .filter(|item| !item.is_empty())
         .collect();
-    let threshold = (request.min_bitrate_mbps.max(0.0) * 1_000_000.0) as u64;
+    let bitrate_threshold = (request.min_bitrate_mbps.max(0.0) * 1_000_000.0) as u64;
+    let size_threshold = (request.min_file_size_mb.max(0.0) * 1_048_576.0) as u64;
     let mut files = Vec::new();
 
     for entry in WalkDir::new(&root)
@@ -243,7 +255,9 @@ fn scan_videos_blocking(request: ScanRequest) -> Result<Vec<VideoFile>, String> 
         let h264_rule = should_transcode_h264(
             &probe.codec,
             probe.bitrate_bps,
-            threshold,
+            metadata.len(),
+            bitrate_threshold,
+            size_threshold,
             request.transcode_h264,
         );
         let (action, reason) = if bad_container && is_hevc {
@@ -254,8 +268,11 @@ fn scan_videos_blocking(request: ScanRequest) -> Result<Vec<VideoFile>, String> 
         } else if bad_container {
             ("transcode", format!(".{extension} 封装不在保留列表"))
         } else if h264_rule {
-            let reason = if threshold == 0 {
-                "已启用转换所有 H.264".to_string()
+            let reason = if bitrate_threshold == 0 {
+                format!(
+                    "H.264 命中文件大小阈值（{:.1} MB），码率不限",
+                    metadata.len() as f64 / 1_048_576.0
+                )
             } else {
                 format!(
                     "H.264 码率 {:.1} Mbps 超过阈值",
@@ -309,8 +326,37 @@ fn emit(app: &AppHandle, event: JobEvent) {
     let _ = app.emit("transcode-event", event);
 }
 
+fn valid_log_filename(filename: &str) -> bool {
+    filename.ends_with(".log")
+        && !filename.is_empty()
+        && filename.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+#[tauri::command]
+fn save_run_log(filename: String, content: String) -> Result<String, String> {
+    if !valid_log_filename(&filename) {
+        return Err("日志文件名无效".to_string());
+    }
+    let appdata = env::var_os("APPDATA").ok_or_else(|| "无法读取 APPDATA 目录".to_string())?;
+    let directory = PathBuf::from(appdata).join("m5ga");
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建日志目录：{error}"))?;
+    let path = directory.join(filename);
+    fs::write(&path, content).map_err(|error| format!("无法保存日志：{error}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 fn output_path(source: &Path) -> PathBuf {
-    source.with_extension("mp4")
+    if source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
+    {
+        source.to_path_buf()
+    } else {
+        source.with_extension("mp4")
+    }
 }
 
 fn temp_path(source: &Path) -> PathBuf {
@@ -637,6 +683,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_tools,
             scan_videos,
+            save_run_log,
             start_transcode,
             cancel_transcode
         ])
@@ -676,6 +723,13 @@ mod tests {
     }
 
     #[test]
+    fn preserves_existing_mp4_extension_case_for_in_place_replacement() {
+        let source = PathBuf::from("video.MP4");
+
+        assert_eq!(output_path(&source), source);
+    }
+
+    #[test]
     fn keeps_source_when_mp4_target_already_exists() {
         let directory = test_directory("collision");
         let source = directory.join("video.mov");
@@ -693,15 +747,46 @@ mod tests {
 
     #[test]
     fn zero_bitrate_threshold_transcodes_every_h264() {
-        assert!(should_transcode_h264("h264", 0, 0, true));
-        assert!(should_transcode_h264("h264", 2_000_000, 0, true));
-        assert!(!should_transcode_h264("hevc", 20_000_000, 0, true));
-        assert!(!should_transcode_h264("h264", 20_000_000, 0, false));
+        assert!(should_transcode_h264(
+            "h264", 0, 30_000_000, 0, 20_000_000, true
+        ));
+        assert!(should_transcode_h264(
+            "h264", 2_000_000, 30_000_000, 0, 20_000_000, true
+        ));
+        assert!(!should_transcode_h264(
+            "hevc", 20_000_000, 30_000_000, 0, 20_000_000, true
+        ));
+        assert!(!should_transcode_h264(
+            "h264", 20_000_000, 30_000_000, 0, 20_000_000, false
+        ));
     }
 
     #[test]
     fn positive_bitrate_threshold_is_enforced() {
-        assert!(!should_transcode_h264("h264", 9_999_999, 10_000_000, true));
-        assert!(should_transcode_h264("h264", 10_000_000, 10_000_000, true));
+        assert!(!should_transcode_h264(
+            "h264", 9_999_999, 30_000_000, 10_000_000, 20_000_000, true
+        ));
+        assert!(should_transcode_h264(
+            "h264", 10_000_000, 30_000_000, 10_000_000, 20_000_000, true
+        ));
+    }
+
+    #[test]
+    fn h264_file_size_threshold_is_enforced() {
+        assert!(!should_transcode_h264(
+            "h264", 20_000_000, 19_999_999, 0, 20_000_000, true
+        ));
+        assert!(should_transcode_h264(
+            "h264", 20_000_000, 20_000_000, 0, 20_000_000, true
+        ));
+        assert!(should_transcode_h264("h264", 20_000_000, 1, 0, 0, true));
+    }
+
+    #[test]
+    fn log_filename_rejects_path_traversal() {
+        assert!(valid_log_filename("m5ga-20260722-120000.log"));
+        assert!(!valid_log_filename("../m5ga.log"));
+        assert!(!valid_log_filename("m5ga.txt"));
+        assert!(!valid_log_filename("m5ga 日志.log"));
     }
 }
