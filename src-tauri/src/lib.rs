@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     env, fs,
     fs::{FileTimes, OpenOptions},
     io::{BufRead, BufReader},
@@ -80,6 +81,7 @@ struct EncodeSettings {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TranscodeRequest {
+    root: String,
     files: Vec<QueueItem>,
     settings: EncodeSettings,
 }
@@ -513,24 +515,52 @@ fn restore_directory_modified_time(
 }
 
 struct DirectoryTimestampGuard {
-    path: PathBuf,
-    modified: Option<std::time::SystemTime>,
+    timestamps: Vec<(PathBuf, std::time::SystemTime)>,
     enabled: bool,
 }
 
 impl DirectoryTimestampGuard {
-    fn new(source: &Path, enabled: bool) -> Self {
-        let path = source
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let modified = enabled
-            .then(|| fs::metadata(&path).and_then(|metadata| metadata.modified()))
-            .and_then(Result::ok);
+    fn new(root: &Path, files: &[QueueItem], enabled: bool) -> Self {
+        if !enabled {
+            return Self {
+                timestamps: Vec::new(),
+                enabled: false,
+            };
+        }
+
+        let mut directories = HashSet::new();
+        directories.insert(root.to_path_buf());
+        for item in files {
+            let source = Path::new(&item.path);
+            let mut current = source.parent();
+            while let Some(directory) = current {
+                if !directory.starts_with(root) {
+                    break;
+                }
+                directories.insert(directory.to_path_buf());
+                if directory == root {
+                    break;
+                }
+                current = directory.parent();
+            }
+        }
+
+        let mut timestamps: Vec<_> = directories
+            .into_iter()
+            .filter_map(|path| {
+                fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .map(|modified| (path, modified))
+            })
+            .collect();
+        // Restore children first and the selected root last, since some NAS implementations
+        // update a parent directory when a child's attributes change.
+        timestamps.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+
         Self {
-            path,
-            modified,
-            enabled,
+            timestamps,
+            enabled: true,
         }
     }
 
@@ -538,10 +568,16 @@ impl DirectoryTimestampGuard {
         if !self.enabled {
             return Ok(());
         }
-        if let Some(modified) = self.modified {
-            restore_directory_modified_time(&self.path, modified)?;
-        }
         self.enabled = false;
+        let mut errors = Vec::new();
+        for (path, modified) in &self.timestamps {
+            if let Err(error) = restore_directory_modified_time(path, *modified) {
+                errors.push(format!("{}：{error}", path.display()));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("；"));
+        }
         Ok(())
     }
 }
@@ -567,8 +603,6 @@ fn run_one(
     let source_metadata = fs::metadata(&source).map_err(|error| error.to_string())?;
     let original_bytes = source_metadata.len();
     let original_modified = source_metadata.modified().ok();
-    let mut directory_timestamp =
-        DirectoryTimestampGuard::new(&source, settings.preserve_timestamps);
     let final_path = output_path(&source);
     if final_path != source && final_path.exists() {
         return Err(format!("同名 MP4 已存在：{}", final_path.display()));
@@ -724,7 +758,6 @@ fn run_one(
             restore_modified_time(&final_path, modified)?;
         }
     }
-    directory_timestamp.restore()?;
     Ok((original_bytes, output_bytes, final_path))
 }
 
@@ -735,6 +768,11 @@ fn run_queue(
     cancel: Arc<AtomicBool>,
 ) {
     let total = request.files.len();
+    let mut directory_timestamps = DirectoryTimestampGuard::new(
+        Path::new(&request.root),
+        &request.files,
+        request.settings.preserve_timestamps,
+    );
     for (offset, item) in request.files.iter().enumerate() {
         let index = offset + 1;
         if cancel.load(Ordering::SeqCst) {
@@ -793,6 +831,7 @@ fn run_queue(
             }
         }
     }
+    let timestamp_error = directory_timestamps.restore().err();
     running.store(false, Ordering::SeqCst);
     emit(
         &app,
@@ -802,12 +841,13 @@ fn run_queue(
             index: total,
             total,
             progress: 100.0,
-            message: if cancel.load(Ordering::SeqCst) {
-                "队列已取消"
+            message: if let Some(error) = timestamp_error {
+                format!("队列已结束，但文件夹修改时间恢复失败：{error}")
+            } else if cancel.load(Ordering::SeqCst) {
+                "队列已取消".to_string()
             } else {
-                "队列处理完成"
-            }
-            .to_string(),
+                "队列处理完成".to_string()
+            },
             original_bytes: None,
             output_bytes: None,
         },
@@ -929,6 +969,38 @@ mod tests {
             .unwrap();
         assert!(difference < std::time::Duration::from_secs(2));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restores_selected_root_and_nested_directories() {
+        let root = test_directory("directory-tree-timestamp");
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let video = nested.join("video.mp4");
+        fs::write(&video, b"video").unwrap();
+        let root_modified = SystemTime::now() - std::time::Duration::from_secs(172_800);
+        let nested_modified = SystemTime::now() - std::time::Duration::from_secs(86_400);
+        restore_directory_modified_time(&nested, nested_modified).unwrap();
+        restore_directory_modified_time(&root, root_modified).unwrap();
+        let files = vec![QueueItem {
+            path: video.to_string_lossy().to_string(),
+            action: "transcode".to_string(),
+            duration_secs: 1.0,
+        }];
+        let mut guard = DirectoryTimestampGuard::new(&root, &files, true);
+
+        fs::write(nested.join("temporary.txt"), b"changed").unwrap();
+        guard.restore().unwrap();
+
+        for (path, expected) in [(&root, root_modified), (&nested, nested_modified)] {
+            let actual = fs::metadata(path).unwrap().modified().unwrap();
+            let difference = actual
+                .duration_since(expected)
+                .or_else(|_| expected.duration_since(actual))
+                .unwrap();
+            assert!(difference < std::time::Duration::from_secs(2));
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
