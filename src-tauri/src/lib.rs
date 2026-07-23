@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
+    fs::{FileTimes, OpenOptions},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -13,7 +14,11 @@ use tauri::{AppHandle, Emitter, State};
 use walkdir::WalkDir;
 
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
+use std::{
+    ffi::c_void,
+    os::windows::{ffi::OsStrExt, process::CommandExt},
+    time::UNIX_EPOCH,
+};
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mov", "avi", "mkv", "m4v", "wmv", "flv", "webm", "mts", "m2ts", "ts",
@@ -69,6 +74,7 @@ struct EncodeSettings {
     cq: u8,
     pixel_format: String,
     replace_if_larger: bool,
+    preserve_timestamps: bool,
 }
 
 #[derive(Deserialize)]
@@ -409,6 +415,143 @@ fn replace_source(source: &Path, temp: &Path, final_path: &Path) -> Result<(), S
     Ok(())
 }
 
+fn restore_modified_time(path: &Path, modified: std::time::SystemTime) -> Result<(), String> {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_times(FileTimes::new().set_modified(modified)))
+        .map_err(|error| format!("文件已替换，但无法恢复原文件修改时间：{error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn restore_directory_modified_time(
+    path: &Path,
+    modified: std::time::SystemTime,
+) -> Result<(), String> {
+    #[repr(C)]
+    struct WindowsFileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            file_name: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *mut c_void,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: *mut c_void,
+        ) -> *mut c_void;
+        fn SetFileTime(
+            file: *mut c_void,
+            creation_time: *const WindowsFileTime,
+            access_time: *const WindowsFileTime,
+            write_time: *const WindowsFileTime,
+        ) -> i32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_SHARE_READ: u32 = 0x0001;
+    const FILE_SHARE_WRITE: u32 = 0x0002;
+    const FILE_SHARE_DELETE: u32 = 0x0004;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const WINDOWS_TO_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
+
+    let duration = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "目录修改时间早于 Windows 支持的时间范围".to_string())?;
+    let ticks = (duration.as_secs() + WINDOWS_TO_UNIX_EPOCH_SECS) * 10_000_000
+        + u64::from(duration.subsec_nanos()) / 100;
+    let write_time = WindowsFileTime {
+        low: ticks as u32,
+        high: (ticks >> 32) as u32,
+    };
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    // Directories require FILE_FLAG_BACKUP_SEMANTICS before their timestamps can be changed.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == (-1_isize) as *mut c_void {
+        return Err(format!(
+            "无法打开目录以恢复修改时间：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let result = unsafe { SetFileTime(handle, std::ptr::null(), std::ptr::null(), &write_time) };
+    let error = (result == 0).then(std::io::Error::last_os_error);
+    unsafe {
+        CloseHandle(handle);
+    }
+    error.map_or(Ok(()), |error| {
+        Err(format!("无法恢复所在文件夹的修改时间：{error}"))
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restore_directory_modified_time(
+    path: &Path,
+    modified: std::time::SystemTime,
+) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|file| file.set_times(FileTimes::new().set_modified(modified)))
+        .map_err(|error| format!("无法恢复所在文件夹的修改时间：{error}"))
+}
+
+struct DirectoryTimestampGuard {
+    path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    enabled: bool,
+}
+
+impl DirectoryTimestampGuard {
+    fn new(source: &Path, enabled: bool) -> Self {
+        let path = source
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let modified = enabled
+            .then(|| fs::metadata(&path).and_then(|metadata| metadata.modified()))
+            .and_then(Result::ok);
+        Self {
+            path,
+            modified,
+            enabled,
+        }
+    }
+
+    fn restore(&mut self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if let Some(modified) = self.modified {
+            restore_directory_modified_time(&self.path, modified)?;
+        }
+        self.enabled = false;
+        Ok(())
+    }
+}
+
+impl Drop for DirectoryTimestampGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 fn run_one(
     app: &AppHandle,
     item: &QueueItem,
@@ -421,9 +564,11 @@ fn run_one(
     if !source.is_file() {
         return Err("源文件不存在".to_string());
     }
-    let original_bytes = fs::metadata(&source)
-        .map_err(|error| error.to_string())?
-        .len();
+    let source_metadata = fs::metadata(&source).map_err(|error| error.to_string())?;
+    let original_bytes = source_metadata.len();
+    let original_modified = source_metadata.modified().ok();
+    let mut directory_timestamp =
+        DirectoryTimestampGuard::new(&source, settings.preserve_timestamps);
     let final_path = output_path(&source);
     if final_path != source && final_path.exists() {
         return Err(format!("同名 MP4 已存在：{}", final_path.display()));
@@ -574,6 +719,12 @@ fn run_one(
         ));
     }
     replace_source(&source, &temp, &final_path)?;
+    if settings.preserve_timestamps {
+        if let Some(modified) = original_modified {
+            restore_modified_time(&final_path, modified)?;
+        }
+    }
+    directory_timestamp.restore()?;
     Ok((original_bytes, output_bytes, final_path))
 }
 
@@ -744,6 +895,40 @@ mod tests {
         let source = PathBuf::from("video.MP4");
 
         assert_eq!(output_path(&source), source);
+    }
+
+    #[test]
+    fn restores_original_modified_time_after_replacement() {
+        let directory = test_directory("timestamp");
+        let output = directory.join("video.mp4");
+        fs::write(&output, b"encoded").unwrap();
+        let expected = SystemTime::now() - std::time::Duration::from_secs(86_400);
+
+        restore_modified_time(&output, expected).unwrap();
+
+        let actual = fs::metadata(&output).unwrap().modified().unwrap();
+        let difference = actual
+            .duration_since(expected)
+            .or_else(|_| expected.duration_since(actual))
+            .unwrap();
+        assert!(difference < std::time::Duration::from_secs(2));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restores_containing_directory_modified_time() {
+        let directory = test_directory("directory-timestamp");
+        let expected = SystemTime::now() - std::time::Duration::from_secs(86_400);
+
+        restore_directory_modified_time(&directory, expected).unwrap();
+
+        let actual = fs::metadata(&directory).unwrap().modified().unwrap();
+        let difference = actual
+            .duration_since(expected)
+            .or_else(|_| expected.duration_since(actual))
+            .unwrap();
+        assert!(difference < std::time::Duration::from_secs(2));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
