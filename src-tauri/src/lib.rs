@@ -38,6 +38,8 @@ struct ScanRequest {
     min_bitrate_mbps: f64,
     min_file_size_mb: f64,
     transcode_h264: bool,
+    #[serde(default)]
+    force_transcode: bool,
     legacy_codecs: Vec<String>,
     unwanted_extensions: Vec<String>,
 }
@@ -75,6 +77,8 @@ struct EncodeSettings {
     cq: u8,
     pixel_format: String,
     replace_if_larger: bool,
+    #[serde(default)]
+    force_transcode: bool,
     preserve_timestamps: bool,
 }
 
@@ -280,7 +284,12 @@ fn scan_videos_blocking(request: ScanRequest) -> Result<Vec<VideoFile>, String> 
             size_threshold,
             request.transcode_h264,
         );
-        let (action, reason) = if bad_container && is_hevc {
+        let (action, reason) = if request.force_transcode {
+            (
+                "transcode",
+                "强制按选定参数重新编码（包括 HEVC）".to_string(),
+            )
+        } else if bad_container && is_hevc {
             (
                 "remux",
                 format!(".{extension} 封装将转换为 .mp4（视频流不重编码）"),
@@ -626,7 +635,8 @@ fn run_one(
             "-map_chapters",
             "0",
         ]);
-    if item.action == "remux" {
+    let remux = item.action == "remux" && !settings.force_transcode;
+    if remux {
         command.args(["-c:v", "copy"]);
     } else {
         command.args(["-c:v", &settings.encoder]);
@@ -744,7 +754,7 @@ fn run_one(
     let output_bytes = fs::metadata(&temp)
         .map_err(|error| error.to_string())?
         .len();
-    if item.action != "remux" && !settings.replace_if_larger && output_bytes >= original_bytes {
+    if !remux && !settings.replace_if_larger && output_bytes >= original_bytes {
         let _ = fs::remove_file(&temp);
         return Err(format!(
             "输出未节省空间（原 {:.2} GB，输出 {:.2} GB），已保留源文件",
@@ -786,7 +796,7 @@ fn run_queue(
                 index,
                 total,
                 progress: 0.0,
-                message: if item.action == "remux" {
+                message: if item.action == "remux" && !request.settings.force_transcode {
                     "正在转换封装"
                 } else {
                     "正在转码"
