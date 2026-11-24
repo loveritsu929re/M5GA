@@ -9,7 +9,9 @@ type Status = "pending" | "running" | "completed" | "failed" | "cancelled";
 interface VideoFile { path:string; relativePath:string; name:string; codec:string; resolution:string; durationSecs:number; bitrateBps:number; sizeBytes:number; needsProcessing:boolean; action:"transcode"|"remux"|"skip"; reason:string; selected?:boolean; status?:Status; progress?:number; result?:string; outputBytes?:number }
 interface JobEvent { kind:"started"|"progress"|"completed"|"failed"|"cancelled"|"batch-finished"; path?:string; index:number; total:number; progress:number; message:string; originalBytes?:number; outputBytes?:number }
 
-const folder=ref(""); const files=ref<VideoFile[]>([]); const scanning=ref(false); const running=ref(false);
+const folderStorageKey="m5ga.lastVideoFolder";
+function loadLastFolder(){try{return localStorage.getItem(folderStorageKey)??""}catch{return""}}
+const folder=ref(loadLastFolder()); const files=ref<VideoFile[]>([]); const scanning=ref(false); const running=ref(false);
 const errorMessage=ref(""); const toolStatus=ref("正在检查 FFmpeg..."); const batchMessage=ref("尚未开始");
 const batchIndex=ref(0); const batchTotal=ref(0); const batchSavedBytes=ref(0); const batchCompleted=ref(0); const logs=ref<string[]>([]); const runLogs=ref<string[]>([]); const showOnlyNeeded=ref(true);
 const legacyCodecOptions=[{value:"mpeg4",label:"MPEG-4 Part 2 (DivX/Xvid)"},{value:"msmpeg4v3",label:"Microsoft MPEG-4 v3"},{value:"mpeg2video",label:"MPEG-2 Video"},{value:"mpeg1video",label:"MPEG-1 Video"},{value:"wmv3",label:"Windows Media Video 9"},{value:"vc1",label:"VC-1"}];
@@ -32,7 +34,7 @@ function logLine(message:string){return `[${new Date().toLocaleString("zh-CN",{h
 function addLog(message:string){logs.value.unshift(logLine(message));logs.value=logs.value.slice(0,100)}
 function addRunLog(message:string){const line=logLine(message);runLogs.value.push(line);logs.value.unshift(line);logs.value=logs.value.slice(0,100)}
 function logFilename(){const now=new Date(),part=(value:number,length=2)=>String(value).padStart(length,"0");return `m5ga-${now.getFullYear()}${part(now.getMonth()+1)}${part(now.getDate())}-${part(now.getHours())}${part(now.getMinutes())}${part(now.getSeconds())}-${part(now.getMilliseconds(),3)}.log`}
-async function chooseFolder(){const selected=await open({directory:true,multiple:false,title:"选择待扫描的视频目录"});if(typeof selected==="string"){folder.value=selected;files.value=[];errorMessage.value=""}}
+async function chooseFolder(){const selected=await open({directory:true,multiple:false,title:"选择待扫描的视频目录",defaultPath:folder.value||undefined});if(typeof selected==="string"){folder.value=selected;files.value=[];errorMessage.value="";try{localStorage.setItem(folderStorageKey,selected)}catch{addLog("无法保存上次选择的目录，下次启动时可能无法恢复")}}}
 async function scan(){if(!folder.value){errorMessage.value="请先选择目录";return}scanning.value=true;errorMessage.value="";batchMessage.value="正在递归读取视频信息...";try{const result=await invoke<VideoFile[]>("scan_videos",{request:{root:folder.value,minBitrateMbps:rules.minBitrateMbps,minFileSizeMb:rules.minFileSizeMb,transcodeH264:rules.transcodeH264,forceTranscode:settings.forceTranscode,legacyCodecs:rules.legacyCodecs,unwantedExtensions:rules.unwantedExtensions}});files.value=result.map(f=>({...f,selected:f.needsProcessing,status:"pending",progress:0}));batchMessage.value=`扫描完成：发现 ${result.length} 个视频，${needCount.value} 个需要处理`;addLog(batchMessage.value)}catch(e){errorMessage.value=String(e);batchMessage.value="扫描失败"}finally{scanning.value=false}}
 function selectAll(value:boolean){files.value.forEach(f=>{if(f.needsProcessing&&f.status!=="completed")f.selected=value})}
 function clearQueue(){const count=files.value.length;files.value=[];batchIndex.value=0;batchTotal.value=0;batchSavedBytes.value=0;batchCompleted.value=0;batchMessage.value="队列已清空";errorMessage.value="";if(count)addLog(`已清空 ${count} 个扫描结果`)}
